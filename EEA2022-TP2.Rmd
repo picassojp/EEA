@@ -1,0 +1,339 @@
+---
+title: 'TP FINAL: Modelado de Residuos Especiales en la Provincia de Buenos Aires'
+author: "Juan Pablo Picasso"
+date: "04/12/2022"
+output:
+  html_document:
+    toc: yes
+    df_print: paged
+  html_notebook:
+    theme: spacelab
+    toc: yes
+    toc_float: yes
+    df_print: paged
+---
+
+# 1) Preparación
+
+### **Se cargan las librerías**
+
+```{r librerias, warning=F, message=F, warn.conflicts=FALSE}
+library(dplyr)
+library(ggplot2)
+library(prophet)
+library(lubridate)
+library(cowplot)
+```
+
+### **Se define el estilo general para los gráficos**
+
+```{r theme general}
+theme <- theme(text = element_text(size=10),
+               plot.title = element_text(size = 12, face = "bold.italic", hjust = 0.5), 
+               axis.title.x = element_text(size = 10, face="bold", colour='black'),         
+               axis.title.y = element_text(size = 10, face="bold"),
+               panel.border = element_blank(),
+               panel.grid.major = element_blank(),
+               panel.grid.minor = element_blank(), 
+               legend.title = element_text(face="bold"))
+```
+
+### **Se cargan los datos**
+
+La variable correspondiente a la "fecha de retiro" se carga en el formato "date" con año, mes y día (YYYY-MM-DD).
+
+```{r data, warning=FALSE,message=F, warn.conflicts=FALSE}
+rrpp <- read.csv('TP2/manifiestos_rree.csv')%>%
+  mutate(fecha_retiro = ymd(fecha_retiro))
+```
+
+# 2) Análisis exploratorio
+
+Presentación resumida de las variables
+
+```{r}
+glimpse(rrpp)
+```
+
+La base de datos original cuenta con 395325 registros y 36 variables. Cada registro cuenta con un número correspondiente al número de manifiesto. 15 de estas variables refieren a distintos datos de los generadores, transportista y operadores, como nombre de la empresa, CUIT, domicilio y localidad.
+
+```{r}
+vars_numericas <- colnames(rrpp %>% select(where(is.numeric)))
+vars_numericas
+```
+
+Las variables numéricas son 7. Aparte de la fecha de retiro, el resto de las variables son de tipo categóricas.
+
+```{r}
+length(unique(rrpp$cuit_generador)) #reviso todas las categorías de la variable
+```
+
+```{r}
+length(unique(rrpp$localidad_transportista)) #reviso todas las categorías de la variable
+```
+
+Los generadores tienen diversas ubicaciones en la provincia (700 localidades) y alcanzan un total de 21293.
+
+```{r}
+length(unique(rrpp$cuit_transportista)) #reviso todas las categorías de la variable
+```
+
+```{r}
+length(unique(rrpp$localidad_destino)) #reviso todas las categorías de la variable
+```
+
+```{r}
+length(unique(rrpp$cuit_destino)) #reviso todas las categorías de la variable
+```
+
+Las empresas transportistas y las operadoras presentan una menor cantidad y también su ubicación se encuentra más acotada. Algunas de estas empresas se encuentran radicadas en otras provincias (ej. Córdoba y Santa Fe).
+
+Se agrega una columna correspondiente al año en el cual se realizo el retiro y posteriormente se calculan las proporciones de registros para cada año.
+
+```{r}
+rrpp$anio <- year(rrpp$fecha_retiro)
+```
+
+Se pretende trabajar con la cantidad total de cada registro.
+
+```{r}
+rrpp$cantidad_total <- rrpp %>% select(contains("cantidad")) %>% rowSums(na.rm=TRUE) 
+```
+
+Focalizando en las variables que se utilizan en el modelo, se presentan los datos de cantidad de registros (o retiros) y peso de residuos especiales.
+
+```{r}
+#calculo la cantidad absoluta y relativa de registros por año
+n_x_anio <- rrpp %>% select(anio, cantidad_total) %>% group_by(anio) %>% summarise(n = n()) %>%
+  mutate(freq = n / sum(n))
+n_x_anio
+```
+
+```{r}
+#grafico de frecuencia relativa con la cantidad de retiros por año
+ggplot(n_x_anio) +
+  geom_bar(aes(x=anio, y=freq, fill=anio), stat="identity", show.legend = FALSE)+
+    labs( x='Año de retiro', y='Frecuencia relativa de cantidad de retiros')
+```
+
+```{r}
+#calculo la cantidad absoluta y relativa de residuos (kg) por año
+cant_x_anio<-rrpp %>% select(anio, cantidad_total) %>% group_by(anio) %>% 
+  summarise(cantidad_total = sum(cantidad_total)) %>%
+  mutate(freq = cantidad_total / sum(cantidad_total))
+cant_x_anio
+```
+
+```{r}
+#grafico de frecuencia relativa con las cantidades de residuos (kg) por año
+ggplot(cant_x_anio) +
+  geom_bar(aes(x=anio, y=freq, fill=anio), stat="identity", show.legend = FALSE)+
+    labs( x='Año de retiro', y='Frecuencia relativa de kilogramos')
+```
+
+Como se puede observar los años con menor proporcion de registros son 2016, 2020 y 2021. Además, al revisar las cantidades de residuos retirados en cada año, los valores no descienden de las 200.000 toneladas. El año 2019 superó las 500.000 toneladas, representando el cerca del 25% de todo el período.
+
+En cada fecha, se observa una gran cantidad de registros, lo cual podría dificultar la visualización por lo que se decide agruparlos. De esta forma, todos los retiros que se hayan realizado en la misma fecha se suman para tener un valor prácticamente diario.
+
+```{r}
+#se arma un df con las cantidades de residuos totales por día
+rrpp_dia<-  rrpp %>% select(cantidad_total, fecha_retiro) %>% group_by(fecha_retiro) %>% 
+              summarise(cantidad_total = sum(cantidad_total))
+rrpp_dia
+```
+
+Nuevamente se grafican los modelos con distintos grados de suavizado
+
+
+# 3) Modelos LOESS
+
+Como primera aproximación se modelan los datos con un modelo LOESS con distintos grados de suavizado (parametro alfa de 0.01, 0.5 y 0.75).
+
+```{r}
+loess=stats::loess(cantidad_total~as.numeric(fecha_retiro), data = rrpp_dia, na.action = 'na.exclude', model = T, span=0.01)
+rrpp_dia['loess']=predict(loess,rrpp_dia)
+loess_1 = ggplot(rrpp_dia, aes(fecha_retiro,cantidad_total)) + geom_point() + geom_line(aes(y=loess), color='firebrick', size=1) +   labs(title= "LOESS span:0.01") + theme_bw() 
+
+loess=stats::loess(cantidad_total~as.numeric(fecha_retiro), data = rrpp_dia, na.action = 'na.exclude', model = T, span=0.5)
+rrpp_dia['loess']=predict(loess,rrpp_dia)
+loess_2 = ggplot(rrpp_dia, aes(fecha_retiro,cantidad_total)) + geom_point() + geom_line(aes(y=loess), color='steelblue', size=1) +   labs(title= "LOESS span:0.50") + theme_bw() 
+
+loess=stats::loess(cantidad_total~as.numeric(fecha_retiro), data = rrpp_dia, na.action = 'na.exclude', model = T, span=0.75)
+rrpp_dia['loess']=predict(loess,rrpp_dia)
+loess_3 = ggplot(rrpp_dia, aes(fecha_retiro,cantidad_total)) + geom_point() + geom_line(aes(y=loess), color='purple', size=1) + 
+  labs(title= "LOESS span:0.75") + theme_bw() 
+
+cowplot::plot_grid(loess_1, loess_2,loess_3)
+```
+
+# 4) Modelo Prophet
+
+Las variables de fecha de retiro y cantidad en kilogramos de residuos se renombran para poder ser cargadas por el modelo. El formato de la variable fecha es el adecuado (YYYY-MM-DD).
+
+```{r}
+#PROPHET DATAFRAME
+prophet_df = rrpp_dia %>% select(fecha_retiro, cantidad_total) %>% rename(., ds=fecha_retiro, y=cantidad_total)
+```
+
+## 4.1) Entrenamiento
+
+Este primer modelo no cuenta con parámetros adicionales de ajuste.
+
+```{r}
+#PROPHET 1
+
+# Llamamos solo al modelo
+prophet_1 = prophet()
+# Le pasamos el dataset
+prophet_1 = fit.prophet(m = prophet_1, prophet_df) 
+
+plot(prophet_1,fcst=predict(prophet_1, prophet_df)) +theme_bw()
+
+#Componentes del modelo
+prophet_plot_components(prophet_1, fcst=predict(prophet_1, prophet_df))
+```
+
+En segunda instancia se agregó una variación temporal asociada al mes. Este nuevo elemento del modelo se estima mediante una suma de Fourier de orden 5.
+
+```{r}
+#PROPHET 2
+
+# Llamamos solo al modelo
+prophet_2=prophet()
+# Agregamos la estacionalidad mensual
+prophet_2=add_seasonality(m=prophet_2, name='monthly', period=365/12, fourier.order = 5)
+
+# Le pasamos el dataset
+prophet_2 = fit.prophet(m = prophet_2, prophet_df) 
+
+plot(prophet_2,fcst=predict(prophet_2, prophet_df)) +theme_bw()
+
+#Componentes del modelo
+prophet_plot_components(prophet_2, fcst=predict(prophet_2, prophet_df))
+```
+
+Se agrega como un evento especial los primeros meses del año cuando los generadores de residuos especiales deben acreditar su gestión ante la Autoridad Ambiental de la PBA.
+
+```{r}
+#PROPHET 3
+
+#se agrega el periodo de presentación anual de DDJJ
+ddjj_rrpp <- function(ds) {
+  dates <- as.Date(ds)
+  month <- as.numeric(format(dates, '%m'))
+  as.numeric((month >= 10  & month <= 12))
+}
+
+rrpp_dia$ddjj <- ddjj_rrpp(rrpp_dia$fecha_retiro)
+
+prophet_df = rrpp_dia %>% select(fecha_retiro, cantidad_total, ddjj) %>% rename(., ds=fecha_retiro, y=cantidad_total)
+
+# Llamamos solo al modelo
+prophet_3=prophet()
+# Agregamos la estacionalidad mensual
+prophet_3=add_seasonality(m=prophet_3, name='monthly', period=365/12, fourier.order = 5)
+
+#agregamos un regresor
+prophet_3 <- add_regressor(prophet_3, 'ddjj')
+
+# Le pasamos el dataset
+prophet_3 = fit.prophet(m = prophet_3, prophet_df) 
+
+plot(prophet_3,fcst=predict(prophet_3, prophet_df)) +theme_bw()
+
+#Componentes del modelo
+prophet_plot_components(prophet_3, fcst=predict(prophet_3, prophet_df))
+```
+
+Como última alternativa, se agregaron los días festivos de Argentina.
+
+```{r fig1, fig.height = 8, fig.width = 8}
+#PROPHET 4
+
+# Llamamos solo al modelo
+prophet_4 <- prophet()
+# Agregamos la estacionalidad mensual
+prophet_4=add_seasonality(m=prophet_4, name='monthly', period=365/12, fourier.order = 5)
+
+#agregamos un regresor
+prophet_4 <- add_regressor(prophet_4, 'ddjj')
+
+#agregamos feriados
+prophet_4 <- add_country_holidays(prophet_4, country_name = 'AR')
+
+
+# Le pasamos el dataset
+prophet_4 = fit.prophet(m = prophet_4, prophet_df) 
+
+plot(prophet_4,fcst=predict(prophet_4, prophet_df)) +theme_bw()
+
+#Componentes del modelo
+prophet_plot_components(prophet_4, fcst=predict(prophet_4, prophet_df))
+
+```
+
+## 4.2) Evaluación
+
+La evaluación de los modelos se realizó mediante predicciones históricas simuladas (SHFs, por sus siglas en inglés). Se optó por períodos iniciales de entrenamiento de 60 días, un horizonte de 15 días y desplazaremos la predicción cada 7 días.
+
+```{r}
+#PROPHET 1
+
+cv_1 = cross_validation(prophet_1, initial = 60, period = 7, horizon = 15, units = 'days')
+
+#métricas de performance
+
+performance_metrics(cv_1, rolling_window = 0.25)
+
+```
+
+```{r}
+#PROPHET 2
+
+cv_2 = cross_validation(prophet_2, initial = 60, period = 7, horizon = 15, units = 'days')
+
+#métricas de performance
+
+performance_metrics(cv_2, rolling_window = 0.25)
+
+```
+
+```{r}
+#PROPHET 3
+
+cv_3 = cross_validation(prophet_3, initial = 60, period = 7, horizon = 15, units = 'days')
+
+#métricas de performance
+
+performance_metrics(cv_3, rolling_window = 0.25)
+```
+
+```{r}
+#PROPHET 4
+
+cv_4 = cross_validation(prophet_4, initial = 60, period = 7, horizon = 15, units = 'days')
+
+#métricas de performance
+
+performance_metrics(cv_4, rolling_window = 0.25)
+```
+
+Se grafica la distribución de las métricas de interés para comparar la performance en los distintos horizontes.
+
+```{r}
+mae_1 = plot_cross_validation_metric(cv_1, metric = 'mae', rolling_window = 0.25) + 
+            theme_bw() + labs(title="Modelo 1: Básico")
+mae_2 = plot_cross_validation_metric(cv_2, metric = 'mae', rolling_window = 0.25) +
+           theme_bw() + labs(title="Modelo 2: Variación por día")
+mae_3 = plot_cross_validation_metric(cv_3, metric = 'mae', rolling_window = 0.25) +
+            theme_bw() + labs(title="Modelo 3: Variación por fiscalización")
+mae_4 = plot_cross_validation_metric(cv_4, metric = 'mae', rolling_window = 0.25) +
+            theme_bw() + labs(title="Modelo 4: Variación por feriados")
+cowplot::plot_grid(mae_1, mae_2, mae_3, mae_4)
+```
+
+# 5) Fuentes de consulta
+
+-   Documentación de Prophet: <https://cran.r-project.org/web/packages/prophet/prophet.pdf>
+-   Documentación de Repositorio de Prophet: <https://facebook.github.io/prophet/docs/>
+-   Material didáctico de la asignatura EEA (Esp. en Data Mining-UBA)
